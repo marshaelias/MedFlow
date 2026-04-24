@@ -1,0 +1,8 @@
+server:
+  port: 9090
+
+glm:
+  api:
+    url: http://localhost:8080/glm/api/v1/chat/completions
+    key: ${GLM_API_KEY:demo-key}
+    model: glm-4

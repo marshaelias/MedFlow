@@ -1,0 +1,614 @@
+package com.medflow.brain;
+
+import com.medflow.agent.*;
+import com.medflow.client.GlmClient;
+import com.medflow.model.*;
+import com.medflow.service.WorkflowEventPublisher;
+import com.medflow.state.WorkflowStateStore;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.stereotype.Component;
+
+import java.util.*;
+import java.util.stream.Collectors;
+
+@Component
+public class MedFlowBrain {
+
+    private final GlmClient glmClient;
+    private final List<WorkerAgent> agents;
+    private final WorkflowStateStore stateStore;
+    private final WorkflowEventPublisher eventPublisher;
+    private final ObjectMapper mapper = new ObjectMapper();
+
+    public MedFlowBrain(GlmClient glmClient, List<WorkerAgent> agents,
+                        WorkflowStateStore stateStore, WorkflowEventPublisher eventPublisher) {
+        this.glmClient = glmClient;
+        this.agents = agents;
+        this.stateStore = stateStore;
+        this.eventPublisher = eventPublisher;
+    }
+
+    public BrainResponse process(String sessionId, String patientMessage) {
+        // 1. Get or create conversation context
+        ConversationContext ctx = stateStore.getOrCreateConversation(sessionId);
+        ctx.addUserMessage(patientMessage);
+
+        WorkflowState workflow = stateStore.createWorkflow();
+        workflow.setStatus(WorkflowState.WorkflowStatus.ANALYZING);
+
+        eventPublisher.publishStatus(sessionId, workflow.getWorkflowId(), "ANALYZING");
+        eventPublisher.publishThinking(sessionId, "Brain", "receive_input",
+                "Received patient message: \"" + patientMessage + "\"", "input");
+
+        // 2. GLM analyzes intent and extracts structured data
+        ReasoningStep analysisStep = new ReasoningStep("Brain", "analyze_input",
+                "Analyzing patient input to determine intent and extract structured data");
+        workflow.addReasoningStep(analysisStep);
+        analysisStep.setStatus(ReasoningStep.StepStatus.RUNNING);
+        eventPublisher.publishStep(sessionId, analysisStep);
+        eventPublisher.publishThinking(sessionId, "Brain", "analyze_input",
+                "Sending to GLM for intent classification and data extraction...", "reasoning");
+
+        BrainAnalysis analysis = analyzeWithGlm(ctx, patientMessage);
+
+        analysisStep.setOutput(Map.of(
+            "intent", analysis.intent,
+            "extracted_data", analysis.extractedData,
+            "missing_fields", analysis.missingFields,
+            "reasoning", analysis.reasoning
+        ));
+        analysisStep.setStatus(ReasoningStep.StepStatus.COMPLETED);
+        eventPublisher.publishStep(sessionId, analysisStep);
+        eventPublisher.publishThinking(sessionId, "Brain", "analysis_complete",
+                "Intent: " + analysis.intent + " | Extracted " + analysis.extractedData.size()
+                        + " data points | Missing: " + (analysis.missingFields.isEmpty() ? "none" : String.join(", ", analysis.missingFields)),
+                "info");
+
+        // 3. Update patient profile with extracted data
+        if (!analysis.extractedData.isEmpty()) {
+            String patientId = (String) analysis.extractedData.getOrDefault("patient_id", "default");
+            PatientProfile profile = stateStore.getOrCreatePatient(patientId);
+            profile.mergeExtractedData(analysis.extractedData);
+            ctx.setPatientId(profile.getPatientId());
+            workflow.setPatientId(profile.getPatientId());
+            stateStore.updatePatient(profile);
+            eventPublisher.publishPatientUpdate(sessionId, profile);
+        }
+
+        // 4. Update context
+        ctx.setCurrentIntent(analysis.intent);
+        analysis.missingFields.forEach(ctx::addMissingField);
+
+        // 5. If there are missing critical fields, pause and ask the patient
+        if (!analysis.missingFields.isEmpty() && shouldAskForMissingData(analysis.missingFields, analysis.intent)) {
+            workflow.setStatus(WorkflowState.WorkflowStatus.AWAITING_DATA);
+            eventPublisher.publishStatus(sessionId, workflow.getWorkflowId(), "AWAITING_DATA");
+
+            ReasoningStep askStep = new ReasoningStep("Brain", "request_missing_data",
+                    "Critical missing fields detected: " + String.join(", ", analysis.missingFields)
+                    + ". Pausing workflow to request data from patient.");
+            askStep.setStatus(ReasoningStep.StepStatus.COMPLETED);
+            askStep.setOutput(Map.of("missing_fields", analysis.missingFields));
+            workflow.addReasoningStep(askStep);
+            eventPublisher.publishStep(sessionId, askStep);
+
+            String prompt = generateMissingDataPrompt(analysis.missingFields, analysis.intent);
+            ctx.addAssistantMessage(prompt);
+            eventPublisher.publishMessage(sessionId, prompt);
+            eventPublisher.publishThinking(sessionId, "Brain", "awaiting_data",
+                    "Cannot proceed without: " + String.join(", ", analysis.missingFields), "warning");
+
+            stateStore.updateConversation(ctx);
+            stateStore.updateWorkflow(workflow);
+
+            return new BrainResponse(
+                workflow.getWorkflowId(), "awaiting_data", prompt,
+                workflow.getReasoningChain(), stateStore.getOrCreatePatient(ctx.getPatientId()),
+                analysis.missingFields
+            );
+        }
+
+        // 6. Resolve previously missing fields if patient provided them
+        if (!ctx.getMissingDataFields().isEmpty()) {
+            ReasoningStep resolveStep = new ReasoningStep("Brain", "resolve_missing_data",
+                    "Checking if patient message resolves previously missing fields: "
+                    + String.join(", ", ctx.getMissingDataFields()));
+            resolveStep.setStatus(ReasoningStep.StepStatus.COMPLETED);
+            workflow.addReasoningStep(resolveStep);
+            eventPublisher.publishStep(sessionId, resolveStep);
+
+            for (String missing : new ArrayList<>(ctx.getMissingDataFields())) {
+                if (analysis.extractedData.containsKey(missing)) {
+                    ctx.resolveMissingField(missing);
+                    eventPublisher.publishThinking(sessionId, "Brain", "field_resolved",
+                            "Resolved missing field: " + missing, "info");
+                }
+            }
+        }
+
+        // 7. Select and execute agents
+        workflow.setStatus(WorkflowState.WorkflowStatus.EXECUTING);
+        eventPublisher.publishStatus(sessionId, workflow.getWorkflowId(), "EXECUTING");
+
+        List<WorkerAgent> selectedAgents = selectAgents(analysis.intent);
+
+        if (selectedAgents.isEmpty()) {
+            workflow.setStatus(WorkflowState.WorkflowStatus.FAILED);
+            eventPublisher.publishStatus(sessionId, workflow.getWorkflowId(), "FAILED");
+
+            ReasoningStep failStep = new ReasoningStep("Brain", "no_agent_found",
+                    "No suitable agent found for intent: " + analysis.intent
+                    + ". Available agents: " + agents.stream().map(WorkerAgent::getName).collect(Collectors.joining(", ")));
+            failStep.setStatus(ReasoningStep.StepStatus.FAILED);
+            failStep.setFallbackPlan("Ask patient to clarify their request so a suitable agent can be selected");
+            workflow.addReasoningStep(failStep);
+            eventPublisher.publishStep(sessionId, failStep);
+
+            String msg = "I'm not sure how to handle that request. Could you describe your symptoms or what you need help with?";
+            ctx.addAssistantMessage(msg);
+            eventPublisher.publishMessage(sessionId, msg);
+            eventPublisher.publishThinking(sessionId, "Brain", "no_agent",
+                    "Could not route to any agent - asking for clarification", "warning");
+
+            stateStore.updateConversation(ctx);
+            stateStore.updateWorkflow(workflow);
+
+            return new BrainResponse(
+                workflow.getWorkflowId(), "no_agent", msg,
+                workflow.getReasoningChain(), stateStore.getOrCreatePatient(ctx.getPatientId()),
+                Collections.emptyList()
+            );
+        }
+
+        // 8. Agent selection reasoning step
+        ReasoningStep selectStep = new ReasoningStep("Brain", "select_agents",
+                "Selected agents for intent '" + analysis.intent + "': "
+                + selectedAgents.stream().map(WorkerAgent::getName).collect(Collectors.joining(" -> ")));
+        selectStep.setStatus(ReasoningStep.StepStatus.COMPLETED);
+        selectStep.setOutput(Map.of("selected_agents",
+                selectedAgents.stream().map(WorkerAgent::getName).collect(Collectors.toList())));
+        workflow.addReasoningStep(selectStep);
+        eventPublisher.publishStep(sessionId, selectStep);
+        eventPublisher.publishThinking(sessionId, "Brain", "agent_selection",
+                "Pipeline: " + selectedAgents.stream().map(WorkerAgent::getName).collect(Collectors.joining(" -> ")),
+                "info");
+
+        // 9. Execute the agent pipeline
+        Map<String, Object> pipelineInput = buildPipelineInput(analysis, ctx);
+        Map<String, Object> accumulatedResults = new HashMap<>(analysis.extractedData);
+        boolean hadFailure = false;
+
+        for (int i = 0; i < selectedAgents.size(); i++) {
+            WorkerAgent agent = selectedAgents.get(i);
+            ReasoningStep agentStep = new ReasoningStep(agent.getName(), "execute",
+                    "Executing " + agent.getName() + " for intent: " + analysis.intent);
+            workflow.addReasoningStep(agentStep);
+            eventPublisher.publishStep(sessionId, agentStep);
+            eventPublisher.publishThinking(sessionId, agent.getName(), "executing",
+                    agent.getDescription() + "...", "active");
+
+            try {
+                pipelineInput.putAll(accumulatedResults);
+                AgentResult result = agent.execute(pipelineInput, agentStep);
+
+                if (result.isSuccess()) {
+                    accumulatedResults.putAll(result.getData());
+                    agentStep.setStatus(ReasoningStep.StepStatus.COMPLETED);
+                    agentStep.setOutput(result.getData());
+                    eventPublisher.publishStep(sessionId, agentStep);
+                    eventPublisher.publishThinking(sessionId, agent.getName(), "completed",
+                            agent.getName() + " completed successfully", "info");
+
+                    if (ctx.getPatientId() != null) {
+                        PatientProfile profile = stateStore.getOrCreatePatient(ctx.getPatientId());
+                        updateProfileFromAgentResult(profile, agent, result);
+                        stateStore.updatePatient(profile);
+                        eventPublisher.publishPatientUpdate(sessionId, profile);
+                    }
+                } else {
+                    hadFailure = true;
+                    agentStep.setStatus(ReasoningStep.StepStatus.FAILED);
+                    eventPublisher.publishStep(sessionId, agentStep);
+
+                    // Brain reasons about the failure and decides a fallback
+                    ReasoningStep fallbackReasonStep = new ReasoningStep("Brain", "reason_fallback",
+                            "Agent " + agent.getName() + " failed: \"" + result.getError()
+                            + "\". Reasoning about fallback strategy...");
+                    fallbackReasonStep.setStatus(ReasoningStep.StepStatus.RUNNING);
+                    workflow.addReasoningStep(fallbackReasonStep);
+                    eventPublisher.publishStep(sessionId, fallbackReasonStep);
+                    eventPublisher.publishThinking(sessionId, "Brain", "reasoning_fallback",
+                            "Agent failed - deciding whether to retry, skip, or use fallback for " + agent.getName(), "warning");
+
+                    FallbackDecision decision = reasonAboutFallback(agent.getName(), result.getError(),
+                            result.getFallbackSuggestion(), i < selectedAgents.size() - 1, accumulatedResults);
+
+                    fallbackReasonStep.setStatus(ReasoningStep.StepStatus.COMPLETED);
+                    fallbackReasonStep.setOutput(Map.of(
+                        "failed_agent", agent.getName(),
+                        "error", result.getError(),
+                        "decision", decision.action,
+                        "reasoning", decision.reasoning
+                    ));
+                    fallbackReasonStep.setFallbackPlan(decision.action + ": " + decision.reasoning);
+                    eventPublisher.publishStep(sessionId, fallbackReasonStep);
+                    eventPublisher.publishThinking(sessionId, "Brain", "fallback_decision",
+                            "Decision: " + decision.action + " - " + decision.reasoning, "warning");
+
+                    workflow.setStatus(WorkflowState.WorkflowStatus.RECOVERING);
+                    eventPublisher.publishStatus(sessionId, workflow.getWorkflowId(), "RECOVERING");
+
+                    switch (decision.action) {
+                        case "use_fallback_data":
+                            if (decision.fallbackData != null) {
+                                accumulatedResults.putAll(decision.fallbackData);
+                            }
+                            break;
+                        case "skip_and_continue":
+                            break;
+                        case "ask_patient":
+                            break;
+                        default:
+                            break;
+                    }
+                }
+            } catch (Exception e) {
+                hadFailure = true;
+                agentStep.setStatus(ReasoningStep.StepStatus.FAILED);
+                agentStep.setFallbackPlan("Unexpected error: " + e.getMessage());
+                eventPublisher.publishStep(sessionId, agentStep);
+
+                ReasoningStep recoveryStep = new ReasoningStep("Brain", "recover_from_error",
+                        "Unexpected error in " + agent.getName() + ": " + e.getMessage()
+                        + ". Attempting to continue pipeline with available data.");
+                recoveryStep.setStatus(ReasoningStep.StepStatus.COMPLETED);
+                workflow.addReasoningStep(recoveryStep);
+                eventPublisher.publishStep(sessionId, recoveryStep);
+                eventPublisher.publishThinking(sessionId, "Brain", "error_recovery",
+                        "Recovered from error in " + agent.getName() + " - continuing pipeline", "error");
+
+                workflow.setStatus(WorkflowState.WorkflowStatus.RECOVERING);
+                eventPublisher.publishStatus(sessionId, workflow.getWorkflowId(), "RECOVERING");
+            }
+        }
+
+        // 10. Generate response via GLM
+        workflow.setStatus(hadFailure ? WorkflowState.WorkflowStatus.COMPLETED_WITH_RECOVERY : WorkflowState.WorkflowStatus.COMPLETED);
+        eventPublisher.publishStatus(sessionId, workflow.getWorkflowId(), hadFailure ? "COMPLETED_WITH_RECOVERY" : "COMPLETED");
+
+        ReasoningStep responseStep = new ReasoningStep("Brain", "generate_response",
+                "Generating patient-facing response summary from workflow results");
+        responseStep.setStatus(ReasoningStep.StepStatus.RUNNING);
+        workflow.addReasoningStep(responseStep);
+        eventPublisher.publishStep(sessionId, responseStep);
+        eventPublisher.publishThinking(sessionId, "Brain", "generating_response",
+                "Composing response with " + accumulatedResults.size() + " data points...", "active");
+
+        String responseText = generateResponse(ctx, accumulatedResults, workflow);
+
+        responseStep.setStatus(ReasoningStep.StepStatus.COMPLETED);
+        eventPublisher.publishStep(sessionId, responseStep);
+        eventPublisher.publishThinking(sessionId, "Brain", "response_complete",
+                "Workflow complete" + (hadFailure ? " (with recovery)" : ""), "info");
+
+        ctx.addAssistantMessage(responseText);
+        eventPublisher.publishMessage(sessionId, responseText);
+
+        stateStore.updateConversation(ctx);
+        stateStore.updateWorkflow(workflow);
+
+        return new BrainResponse(
+            workflow.getWorkflowId(),
+            hadFailure ? "completed_with_recovery" : "completed",
+            responseText,
+            workflow.getReasoningChain(),
+            stateStore.getOrCreatePatient(ctx.getPatientId()),
+            Collections.emptyList()
+        );
+    }
+
+    private void updateProfileFromAgentResult(PatientProfile profile, WorkerAgent agent, AgentResult result) {
+        if (agent instanceof TriageAgent) {
+            profile.setUrgencyLevel((String) result.getData().get("urgency_level"));
+            profile.setCondition((String) result.getData().get("likely_condition"));
+            if (result.getData().get("recommended_department") != null) {
+                if (profile.getAppointment() == null) {
+                    profile.setAppointment(new PatientProfile.AppointmentInfo());
+                }
+                profile.getAppointment().setDepartment((String) result.getData().get("recommended_department"));
+            }
+        } else if (agent instanceof InsuranceValidatorAgent) {
+            PatientProfile.InsuranceInfo ins = profile.getInsurance();
+            if (ins == null) {
+                ins = new PatientProfile.InsuranceInfo();
+            }
+            ins.setCoverageStatus((String) result.getData().get("coverage_status"));
+            ins.setVerified(!Boolean.TRUE.equals(result.getData().get("fallback_used")));
+            if (result.getData().get("copay_amount") != null) {
+                ins.setCopayAmount(String.valueOf(result.getData().get("copay_amount")));
+            }
+            profile.setInsurance(ins);
+        } else if (agent instanceof SchedulerAgent) {
+            PatientProfile.AppointmentInfo appt = profile.getAppointment();
+            if (appt == null) {
+                appt = new PatientProfile.AppointmentInfo();
+            }
+            appt.setScheduledTime((String) result.getData().get("scheduled_time"));
+            appt.setDepartment((String) result.getData().get("department"));
+            appt.setProvider((String) result.getData().get("provider_name"));
+            if (result.getData().get("scheduling_notes") != null) {
+                appt.setNotes((String) result.getData().get("scheduling_notes"));
+            }
+            profile.setAppointment(appt);
+        }
+    }
+
+    private FallbackDecision reasonAboutFallback(String agentName, String error, String suggestion,
+                                                  boolean hasNextAgent, Map<String, Object> currentResults) {
+        try {
+            GlmClient.GlmRequest request = new GlmClient.GlmRequest()
+                    .system("""
+                        You are a workflow recovery AI. An agent in a medical workflow pipeline has failed.
+                        Decide the best recovery action:
+                        - "use_fallback_data": Provide estimated/default data to keep the pipeline moving
+                        - "skip_and_continue": Skip this agent and proceed with remaining agents
+                        - "ask_patient": Ask the patient for the missing information
+
+                        Respond in JSON:
+                        {
+                          "action": "use_fallback_data|skip_and_continue|ask_patient",
+                          "reasoning": "why this is the best action",
+                          "fallback_data": { ... default/estimated data if action is use_fallback_data ... }
+                        }
+                        """)
+                    .user("Failed agent: " + agentName + "\nError: " + error
+                          + "\nAgent suggestion: " + suggestion
+                          + "\nHas next agent: " + hasNextAgent
+                          + "\nCurrent results: " + mapper.writeValueAsString(currentResults))
+                    .jsonMode();
+
+            GlmClient.GlmResponse response = glmClient.chat(request);
+            Map<String, Object> parsed = mapper.readValue(response.getContent(), Map.class);
+
+            FallbackDecision decision = new FallbackDecision();
+            decision.action = (String) parsed.getOrDefault("action", "skip_and_continue");
+            decision.reasoning = (String) parsed.getOrDefault("reasoning", "");
+            decision.fallbackData = (Map<String, Object>) parsed.get("fallback_data");
+            return decision;
+        } catch (Exception e) {
+            FallbackDecision decision = new FallbackDecision();
+            decision.action = "skip_and_continue";
+            decision.reasoning = "GLM unavailable for fallback reasoning. " + suggestion;
+            return decision;
+        }
+    }
+
+    private BrainAnalysis analyzeWithGlm(ConversationContext ctx, String message) {
+        try {
+            String conversationHistory = ctx.getHistory().stream()
+                    .limit(10)
+                    .map(m -> m.getRole() + ": " + m.getContent())
+                    .collect(Collectors.joining("\n"));
+
+            GlmClient.GlmRequest request = new GlmClient.GlmRequest()
+                    .system("""
+                        You are the reasoning engine of a medical workflow system called MedFlow. Analyze the patient's message and:
+                        1. Determine the primary intent. Possible intents: triage, insurance_verification, scheduling, general
+                        2. Extract any patient data (name, age, gender, symptoms, insurance info, preferred times, etc.)
+                        3. Identify any missing critical information needed for the workflow to proceed
+                        4. Provide your step-by-step reasoning
+
+                        Respond in JSON format:
+                        {
+                          "intent": "triage|insurance_verification|scheduling|general",
+                          "extracted_data": { ... key-value pairs of extracted info ... },
+                          "missing_fields": [ ... list of missing field names ... ],
+                          "reasoning": "step by step reasoning about what the patient needs"
+                        }
+                        """)
+                    .user("Conversation so far:\n" + conversationHistory + "\n\nLatest message: " + message)
+                    .jsonMode();
+
+            GlmClient.GlmResponse response = glmClient.chat(request);
+            Map<String, Object> parsed = mapper.readValue(response.getContent(), Map.class);
+
+            return new BrainAnalysis(
+                (String) parsed.getOrDefault("intent", "general"),
+                (Map<String, Object>) parsed.getOrDefault("extracted_data", new HashMap<>()),
+                (List<String>) parsed.getOrDefault("missing_fields", new ArrayList<>()),
+                (String) parsed.getOrDefault("reasoning", "")
+            );
+        } catch (Exception e) {
+            return fallbackAnalysis(message);
+        }
+    }
+
+    private BrainAnalysis fallbackAnalysis(String message) {
+        String lower = message.toLowerCase();
+        String intent = "general";
+        Map<String, Object> data = new HashMap<>();
+        List<String> missing = new ArrayList<>();
+        StringBuilder reasoning = new StringBuilder("Rule-based fallback analysis (GLM unavailable). ");
+
+        if (lower.contains("pain") || lower.contains("sick") || lower.contains("symptom") || lower.contains("feel")
+                || lower.contains("hurt") || lower.contains("dizzy") || lower.contains("nausea") || lower.contains("headache")) {
+            intent = "triage";
+            data.put("symptoms_source", "patient_message");
+            missing.add("structured_symptoms");
+            reasoning.append("Detected symptom-related keywords -> triage intent. ");
+        }
+        if (lower.contains("insurance") || lower.contains("coverage") || lower.contains("policy") || lower.contains("copay")) {
+            intent = "insurance_verification";
+            missing.add("insurance_provider");
+            missing.add("policy_number");
+            reasoning.append("Detected insurance-related keywords -> insurance_verification intent. ");
+        }
+        if (lower.contains("appointment") || lower.contains("schedule") || lower.contains("book") || lower.contains("visit")) {
+            intent = "scheduling";
+            missing.add("preferred_time");
+            reasoning.append("Detected scheduling-related keywords -> scheduling intent. ");
+        }
+
+        data.put("raw_message", message);
+        return new BrainAnalysis(intent, data, missing, reasoning.toString());
+    }
+
+    private List<WorkerAgent> selectAgents(String intent) {
+        List<WorkerAgent> selected = agents.stream()
+                .filter(a -> a.canHandle(intent))
+                .collect(Collectors.toList());
+
+        if ("triage".equals(intent)) {
+            agents.stream()
+                    .filter(a -> a instanceof SchedulerAgent)
+                    .findFirst()
+                    .ifPresent(a -> { if (!selected.contains(a)) selected.add(a); });
+        }
+
+        if ("insurance_verification".equals(intent)) {
+            agents.stream()
+                    .filter(a -> a instanceof SchedulerAgent)
+                    .findFirst()
+                    .ifPresent(a -> { if (!selected.contains(a)) selected.add(a); });
+        }
+
+        return selected;
+    }
+
+    private boolean shouldAskForMissingData(List<String> missing, String intent) {
+        Set<String> criticalInsurance = Set.of("insurance_provider", "policy_number");
+        if ("insurance_verification".equals(intent)) {
+            return missing.stream().anyMatch(criticalInsurance::contains);
+        }
+        if ("triage".equals(intent)) {
+            return false;
+        }
+        return missing.stream().anyMatch(f -> f.equals("patient_name"));
+    }
+
+    private String generateMissingDataPrompt(List<String> missing, String intent) {
+        StringBuilder sb = new StringBuilder("I need a bit more information to help you. Could you please provide:\n");
+        for (String field : missing) {
+            sb.append("- ").append(field.replace("_", " ")).append("\n");
+        }
+        if ("insurance_verification".equals(intent)) {
+            sb.append("\nThis will help me verify your insurance coverage quickly.");
+        } else if ("scheduling".equals(intent)) {
+            sb.append("\nThis will help me find the best available appointment for you.");
+        }
+        return sb.toString();
+    }
+
+    private Map<String, Object> buildPipelineInput(BrainAnalysis analysis, ConversationContext ctx) {
+        Map<String, Object> input = new HashMap<>(analysis.extractedData);
+        input.put("session_id", ctx.getSessionId());
+        if (ctx.getPatientId() != null) {
+            PatientProfile profile = stateStore.getOrCreatePatient(ctx.getPatientId());
+            if (profile.getName() != null) input.put("patient_name", profile.getName());
+            if (profile.getUrgencyLevel() != null) input.put("urgency_level", profile.getUrgencyLevel());
+            if (profile.getInsurance() != null) {
+                if (profile.getInsurance().getProvider() != null) {
+                    input.put("insurance_provider", profile.getInsurance().getProvider());
+                }
+                if (profile.getInsurance().getPolicyNumber() != null) {
+                    input.put("policy_number", profile.getInsurance().getPolicyNumber());
+                }
+            }
+            if (profile.getAppointment() != null && profile.getAppointment().getDepartment() != null) {
+                input.put("department", profile.getAppointment().getDepartment());
+            }
+        }
+        input.put("message", ctx.getLastUserMessage());
+        return input;
+    }
+
+    private String generateResponse(ConversationContext ctx, Map<String, Object> results, WorkflowState workflow) {
+        try {
+            GlmClient.GlmRequest request = new GlmClient.GlmRequest()
+                    .system("""
+                        You are a medical workflow assistant named MedFlow. Summarize the workflow results for the patient
+                        in a clear, empathetic, and professional way. Include:
+                        1. What was determined (triage result, insurance status, appointment)
+                        2. What the next steps are
+                        3. Any important notes or warnings
+
+                        Respond in JSON:
+                        {
+                          "response": "your response text here"
+                        }
+                        """)
+                    .user("Workflow results: " + mapper.writeValueAsString(results)
+                          + "\nWorkflow status: " + workflow.getStatus())
+                    .jsonMode();
+
+            GlmClient.GlmResponse response = glmClient.chat(request);
+            Map<String, Object> parsed = mapper.readValue(response.getContent(), Map.class);
+            return (String) parsed.getOrDefault("response", "Your request has been processed. Please check your dashboard for details.");
+        } catch (Exception e) {
+            StringBuilder sb = new StringBuilder("Here's a summary of your workflow:\n");
+            if (results.containsKey("urgency_level")) {
+                sb.append("- Urgency: ").append(results.get("urgency_level")).append("\n");
+            }
+            if (results.containsKey("likely_condition")) {
+                sb.append("- Assessment: ").append(results.get("likely_condition")).append("\n");
+            }
+            if (results.containsKey("coverage_status")) {
+                sb.append("- Insurance: ").append(results.get("coverage_status")).append("\n");
+            }
+            if (results.containsKey("scheduled_time")) {
+                sb.append("- Appointment: ").append(results.get("scheduled_time")).append("\n");
+            }
+            if (results.containsKey("recommended_department")) {
+                sb.append("- Department: ").append(results.get("recommended_department")).append("\n");
+            }
+            return sb.toString();
+        }
+    }
+
+    private static class BrainAnalysis {
+        String intent;
+        Map<String, Object> extractedData;
+        List<String> missingFields;
+        String reasoning;
+
+        BrainAnalysis(String intent, Map<String, Object> extractedData, List<String> missingFields, String reasoning) {
+            this.intent = intent;
+            this.extractedData = extractedData;
+            this.missingFields = missingFields;
+            this.reasoning = reasoning;
+        }
+    }
+
+    private static class FallbackDecision {
+        String action;
+        String reasoning;
+        Map<String, Object> fallbackData;
+    }
+
+    public static class BrainResponse {
+        private String workflowId;
+        private String status;
+        private String message;
+        private List<ReasoningStep> reasoningChain;
+        private PatientProfile patientProfile;
+        private List<String> missingFields;
+
+        public BrainResponse(String workflowId, String status, String message,
+                           List<ReasoningStep> reasoningChain, PatientProfile patientProfile,
+                           List<String> missingFields) {
+            this.workflowId = workflowId;
+            this.status = status;
+            this.message = message;
+            this.reasoningChain = reasoningChain;
+            this.patientProfile = patientProfile;
+            this.missingFields = missingFields;
+        }
+
+        public String getWorkflowId() { return workflowId; }
+        public String getStatus() { return status; }
+        public String getMessage() { return message; }
+        public List<ReasoningStep> getReasoningChain() { return reasoningChain; }
+        public PatientProfile getPatientProfile() { return patientProfile; }
+        public List<String> getMissingFields() { return missingFields; }
+    }
+}
