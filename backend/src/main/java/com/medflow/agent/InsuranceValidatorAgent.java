@@ -56,13 +56,20 @@ public class InsuranceValidatorAgent implements WorkerAgent {
 
             GlmClient.GlmRequest request = new GlmClient.GlmRequest()
                     .system("""
-                        You are an insurance verification AI. Given the insurance details and required service,
-                        determine:
-                        1. coverage_status: "full", "partial", or "denied"
-                        2. copay_amount: estimated copay
+                        You are an insurance verification AI. Verify the patient's insurance and detect any issues.
+
+                        CRITICAL RULES:
+                        - If the patient's insurance is expired, cancelled, or lapsed, clearly flag it as a conflict.
+                        - When insurance is invalid, suggest the "Self-Pay" workflow as an alternative.
+                        - Do not assume insurance is valid if the patient says it is expired.
+
+                        Determine:
+                        1. coverage_status: "full", "partial", "denied", or "expired"
+                        2. copay_amount: estimated copay (or "N/A" if expired)
                         3. pre_authorization_required: boolean
-                        4. covered_services: list of covered items
-                        5. reasoning: step by step verification reasoning
+                        4. conflict: if insurance is expired/invalid, describe the conflict and suggested action
+                        5. suggested_workflow: "standard" or "self_pay"
+                        6. reasoning: step by step verification reasoning
 
                         Respond in JSON format.
                         """)

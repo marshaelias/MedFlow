@@ -49,12 +49,20 @@ public class TriageAgent implements WorkerAgent {
 
             GlmClient.GlmRequest request = new GlmClient.GlmRequest()
                     .system("""
-                        You are a medical triage AI. Analyze the patient's symptoms and determine:
-                        1. urgency_level: one of "critical", "high", "medium", "low"
-                        2. likely_condition: brief description of likely condition
-                        3. recommended_department: which department to route to
-                        4. additional_questions: list of follow-up questions to ask the patient
-                        5. reasoning: your clinical reasoning step by step
+                        You are a medical triage AI. Analyze ONLY the symptoms the patient has explicitly mentioned.
+
+                        CRITICAL RULES:
+                        - Extract ONLY symptoms the patient explicitly stated. Do NOT add related or assumed symptoms.
+                        - If the patient says "cough and fever", extract ONLY "cough" and "fever" — NOT "sore throat" or "fatigue".
+                        - Assign severity based ONLY on the patient's own description (e.g., "severe" = high, "mild" = low).
+
+                        Determine:
+                        1. symptoms: list of ONLY explicitly mentioned symptoms
+                        2. severity_per_symptom: map of each symptom to its severity (high/medium/low)
+                        3. urgency_level: one of "critical", "high", "medium", "low"
+                        4. likely_condition: brief description based ONLY on stated symptoms
+                        5. recommended_department: which department to route to
+                        6. reasoning: step by step reasoning (note what was explicitly stated vs inferred)
 
                         Respond in JSON format.
                         """)

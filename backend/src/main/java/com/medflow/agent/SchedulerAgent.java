@@ -50,13 +50,22 @@ public class SchedulerAgent implements WorkerAgent {
 
             GlmClient.GlmRequest request = new GlmClient.GlmRequest()
                     .system("""
-                        You are a medical scheduling AI. Given the patient's urgency, department, and preferences,
-                        determine:
-                        1. scheduled_time: suggested appointment time (ISO format)
+                        You are a medical scheduling AI. Given the patient's urgency, department, and constraints,
+                        determine the best appointment option.
+
+                        CRITICAL RULES:
+                        - Respect ALL patient-stated constraints (e.g., "only free Tuesday mornings").
+                        - If constraints are conflicting or too restrictive, note this and suggest alternatives.
+                        - If patient_name is missing, flag it as a missing requirement.
+
+                        Determine:
+                        1. scheduled_time: suggested appointment time (respecting constraints)
                         2. provider_name: assigned provider
                         3. department: confirmed department
-                        4. scheduling_notes: any special instructions
-                        5. reasoning: step by step scheduling reasoning
+                        4. scheduling_notes: any special instructions or constraint notes
+                        5. constraints_applied: list of patient constraints that were respected
+                        6. missing_requirements: list of any missing info needed for confirmation
+                        7. reasoning: step by step scheduling reasoning
 
                         Respond in JSON format.
                         """)
