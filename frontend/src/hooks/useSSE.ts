@@ -4,9 +4,7 @@ import type {
   ReasoningStep,
   PatientProfile,
   WorkflowStatusEvent,
-  AssistantMessageEvent,
   ThinkingEvent,
-  ConnectedEvent,
 } from '@/types/api';
 
 export interface SSEState {
@@ -40,10 +38,8 @@ export function useSSE(sessionId: string | null, onEvent: SSEHandler) {
     const es = createEventSource(sessionId);
     esRef.current = es;
 
-    es.addEventListener('connected', (e) => {
-      const data = JSON.parse((e as MessageEvent).data) as ConnectedEvent;
+    es.addEventListener('connected', () => {
       update({ connected: true });
-      console.log('SSE connected:', data.session);
     });
 
     es.addEventListener('reasoning_step', (e) => {
@@ -63,8 +59,7 @@ export function useSSE(sessionId: string | null, onEvent: SSEHandler) {
       update({ workflowStatus: data.status });
     });
 
-    es.addEventListener('assistant_message', (e) => {
-      const data = JSON.parse((e as MessageEvent).data) as AssistantMessageEvent;
+    es.addEventListener('assistant_message', () => {
       update({ thinking: null });
     });
 

@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { Send, Bot, User, Loader2 } from 'lucide-react';
+import { Send, Bot, User, Loader2, AlertTriangle, CheckCircle, Info } from 'lucide-react';
 import { sendChatMessage } from '@/services/api';
 import { useSSE, type SSEState } from '@/hooks/useSSE';
 import type { ChatMessage, BrainResponse } from '@/types/api';
@@ -9,6 +9,76 @@ interface AIChatProps {
   onPatientUpdate: (profile: BrainResponse['patient_profile']) => void;
   onReasoningUpdate: (steps: BrainResponse['reasoning_chain']) => void;
   onWorkflowStatusChange: (status: string) => void;
+}
+
+function renderStructuredContent(content: string) {
+  const lines = content.split('\n');
+  return lines.map((line, i) => {
+    const trimmed = line.trim();
+
+    // Conflict lines: ⚠ or "Conflict:"
+    if (trimmed.startsWith('⚠') || trimmed.startsWith('Conflict:') || trimmed.startsWith('Conflict Identified:')) {
+      return (
+        <div key={i} className="flex items-start gap-2 my-1.5 p-2 rounded-lg bg-red-50 border border-red-200/60">
+          <AlertTriangle className="w-4 h-4 text-urgency-critical shrink-0 mt-0.5" />
+          <span className="text-red-700 text-sm">{trimmed.replace('⚠ ', '')}</span>
+        </div>
+      );
+    }
+
+    // Suggested Action lines
+    if (trimmed.startsWith('Suggested Action:')) {
+      return (
+        <div key={i} className="flex items-start gap-2 my-1.5 p-2 rounded-lg bg-green-50 border border-green-200/60">
+          <CheckCircle className="w-4 h-4 text-urgency-low shrink-0 mt-0.5" />
+          <span className="text-green-700 text-sm">{trimmed}</span>
+        </div>
+      );
+    }
+
+    // Symptom lines: "Symptom: X, Severity: Y"
+    if (trimmed.startsWith('Symptom:')) {
+      return (
+        <div key={i} className="flex items-center gap-3 my-1 p-1.5 rounded-md bg-violet-50">
+          <span className="text-sm text-violet-800 font-medium">{trimmed}</span>
+        </div>
+      );
+    }
+
+    // Missing Data / "Missing:" lines
+    if (trimmed.startsWith('Missing Data') || trimmed.startsWith('Missing:') || trimmed.startsWith('- ')) {
+      return (
+        <div key={i} className="flex items-start gap-2 my-0.5">
+          <Info className="w-3.5 h-3.5 text-amber-500 shrink-0 mt-0.5" />
+          <span className="text-sm text-amber-700">{trimmed}</span>
+        </div>
+      );
+    }
+
+    // Intent / Action / Reasoning section headers
+    if (trimmed.startsWith('Intent:') || trimmed.startsWith('Action:') || trimmed.startsWith('Reasoning') || trimmed.startsWith('Constraint:')) {
+      return (
+        <div key={i} className="my-1">
+          <span className="text-xs font-semibold text-blue-600 uppercase tracking-wider">{trimmed}</span>
+        </div>
+      );
+    }
+
+    // Urgency lines
+    if (trimmed.startsWith('Urgency:') || trimmed.startsWith('Urgency Level:')) {
+      const level = trimmed.toLowerCase();
+      const colorClass = level.includes('critical') ? 'text-urgency-critical' : level.includes('high') ? 'text-urgency-high' : level.includes('medium') ? 'text-urgency-medium' : 'text-urgency-low';
+      return (
+        <div key={i} className={`my-1 text-sm font-semibold ${colorClass}`}>{trimmed}</div>
+      );
+    }
+
+    // Empty lines
+    if (!trimmed) return <div key={i} className="h-2" />;
+
+    // Default
+    return <div key={i} className="text-sm text-slate-700 leading-relaxed">{trimmed}</div>;
+  });
 }
 
 export default function AIChat({
@@ -29,6 +99,7 @@ export default function AIChat({
       if (state.workflowStatus) onWorkflowStatusChange(state.workflowStatus);
 
       if (state.thinking) {
+        const t = state.thinking;
         setMessages((prev) => {
           const last = prev[prev.length - 1];
           if (last?.role === 'system' && last.metadata?.type === 'thinking') return prev;
@@ -37,7 +108,7 @@ export default function AIChat({
             {
               id: `thinking-${Date.now()}`,
               role: 'system',
-              content: `${state.thinking.agent}: ${state.thinking.content}`,
+              content: `${t.agent}: ${t.content}`,
               timestamp: new Date().toISOString(),
               metadata: { type: 'thinking' },
             },
@@ -87,6 +158,17 @@ export default function AIChat({
       if (res.patient_profile) onPatientUpdate(res.patient_profile);
       if (res.reasoning_chain) onReasoningUpdate(res.reasoning_chain);
       if (res.status) onWorkflowStatusChange(res.status);
+      if (res.missing_fields && res.missing_fields.length > 0) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `missing-${Date.now()}`,
+            role: 'system',
+            content: `Missing Information: ${res.missing_fields!.join(', ').replace(/_/g, ' ')}`,
+            timestamp: new Date().toISOString(),
+          },
+        ]);
+      }
     } catch (err) {
       setMessages((prev) => [
         ...prev,
@@ -156,7 +238,7 @@ export default function AIChat({
                     : 'bg-slate-100 text-slate-800 rounded-bl-md'
               }`}
             >
-              {msg.content}
+              {msg.role === 'assistant' ? renderStructuredContent(msg.content) : msg.content}
             </div>
             {msg.role === 'user' && (
               <div className="w-7 h-7 rounded-lg bg-slate-700 text-white flex items-center justify-center shrink-0 mt-0.5">

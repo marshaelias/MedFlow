@@ -25,8 +25,11 @@ public class SchedulerAgent implements WorkerAgent {
 
     @Override
     public boolean canHandle(String intent) {
-        return intent != null && (intent.contains("schedule") || intent.contains("appointment")
-                || intent.contains("book") || intent.contains("availability"));
+        if (intent == null) return false;
+        String lower = intent.toLowerCase();
+        return lower.contains("schedule") || lower.contains("appointment")
+                || lower.contains("book") || lower.contains("availability")
+                || lower.contains("visit") || lower.contains("consultation");
     }
 
     @Override
@@ -75,6 +78,7 @@ public class SchedulerAgent implements WorkerAgent {
                     .jsonMode();
 
             GlmClient.GlmResponse response = glmClient.chat(request);
+            @SuppressWarnings("unchecked")
             Map<String, Object> scheduleData = mapper.readValue(response.getContent(), Map.class);
 
             currentStep.setOutput(scheduleData);

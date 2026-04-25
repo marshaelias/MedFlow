@@ -25,8 +25,11 @@ public class TriageAgent implements WorkerAgent {
 
     @Override
     public boolean canHandle(String intent) {
-        return intent != null && (intent.contains("triage") || intent.contains("symptom")
-                || intent.contains("urgency") || intent.contains("assess"));
+        if (intent == null) return false;
+        String lower = intent.toLowerCase();
+        return lower.contains("triage") || lower.contains("symptom") || lower.contains("urgency")
+                || lower.contains("assess") || lower.contains("medical") || lower.contains("health")
+                || lower.contains("illness") || lower.contains("condition") || lower.contains("diagnosis");
     }
 
     @Override
@@ -35,6 +38,7 @@ public class TriageAgent implements WorkerAgent {
 
         try {
             String patientMessage = (String) input.getOrDefault("message", "");
+            @SuppressWarnings("unchecked")
             List<String> symptoms = input.containsKey("symptoms")
                     ? (List<String>) input.get("symptoms")
                     : Collections.emptyList();
@@ -71,6 +75,7 @@ public class TriageAgent implements WorkerAgent {
                     .jsonMode();
 
             GlmClient.GlmResponse response = glmClient.chat(request);
+            @SuppressWarnings("unchecked")
             Map<String, Object> triageData = mapper.readValue(response.getContent(), Map.class);
 
             currentStep.setOutput(triageData);

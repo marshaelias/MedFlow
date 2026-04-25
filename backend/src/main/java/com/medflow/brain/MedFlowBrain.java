@@ -28,7 +28,9 @@ public class MedFlowBrain {
         this.eventPublisher = eventPublisher;
     }
 
+    @SuppressWarnings("unchecked")
     public BrainResponse process(String sessionId, String patientMessage) {
+       
         // 1. Get or create conversation context
         ConversationContext ctx = stateStore.getOrCreateConversation(sessionId);
         ctx.addUserMessage(patientMessage);
@@ -107,6 +109,7 @@ public class MedFlowBrain {
                 if (analysis.extractedData.containsKey("symptoms")) {
                     Object symptoms = analysis.extractedData.get("symptoms");
                     if (symptoms instanceof List) {
+                        
                         conflictMsg.append("Symptoms noted: ").append(String.join(", ", (List<String>) symptoms)).append("\n\n");
                     }
                 }
@@ -394,6 +397,7 @@ public class MedFlowBrain {
         }
     }
 
+    @SuppressWarnings("unchecked")
     private FallbackDecision reasonAboutFallback(String agentName, String error, String suggestion,
                                                   boolean hasNextAgent, Map<String, Object> currentResults) {
         try {
@@ -419,6 +423,7 @@ public class MedFlowBrain {
                     .jsonMode();
 
             GlmClient.GlmResponse response = glmClient.chat(request);
+            @SuppressWarnings("unchecked")
             Map<String, Object> parsed = mapper.readValue(response.getContent(), Map.class);
 
             FallbackDecision decision = new FallbackDecision();
@@ -434,6 +439,7 @@ public class MedFlowBrain {
         }
     }
 
+    @SuppressWarnings("unchecked")
     private BrainAnalysis analyzeWithGlm(ConversationContext ctx, String message) {
         try {
             String conversationHistory = ctx.getHistory().stream()
@@ -470,8 +476,10 @@ public class MedFlowBrain {
                     .jsonMode();
 
             GlmClient.GlmResponse response = glmClient.chat(request);
+            @SuppressWarnings("unchecked")
             Map<String, Object> parsed = mapper.readValue(response.getContent(), Map.class);
 
+            @SuppressWarnings("unchecked")
             BrainAnalysis analysis = new BrainAnalysis(
                 (String) parsed.getOrDefault("intent", "general"),
                 (Map<String, Object>) parsed.getOrDefault("extracted_data", new HashMap<>()),
@@ -581,6 +589,14 @@ public class MedFlowBrain {
                     .ifPresent(a -> { if (!selected.contains(a)) selected.add(a); });
         }
 
+        // Fallback: if intent is "general" but we have symptoms, route to triage
+        if (selected.isEmpty() && "general".equals(intent)) {
+            agents.stream()
+                    .filter(a -> a instanceof TriageAgent)
+                    .findFirst()
+                    .ifPresent(selected::add);
+        }
+
         return selected;
     }
 
@@ -680,6 +696,7 @@ public class MedFlowBrain {
                     .jsonMode();
 
             GlmClient.GlmResponse response = glmClient.chat(request);
+            @SuppressWarnings("unchecked")
             Map<String, Object> parsed = mapper.readValue(response.getContent(), Map.class);
             return (String) parsed.getOrDefault("response", "Your request has been processed. Please check your dashboard for details.");
         } catch (Exception e) {

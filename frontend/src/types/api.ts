@@ -116,4 +116,6 @@ export interface ChatMessage {
   role: 'user' | 'assistant' | 'system';
   content: string;
   timestamp: string;
+  metadata?: Record<string, unknown>;
 }
+

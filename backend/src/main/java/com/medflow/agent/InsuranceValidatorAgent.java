@@ -25,8 +25,11 @@ public class InsuranceValidatorAgent implements WorkerAgent {
 
     @Override
     public boolean canHandle(String intent) {
-        return intent != null && (intent.contains("insurance") || intent.contains("coverage")
-                || intent.contains("eligibility") || intent.contains("verify"));
+        if (intent == null) return false;
+        String lower = intent.toLowerCase();
+        return lower.contains("insurance") || lower.contains("coverage")
+                || lower.contains("eligibility") || lower.contains("verify")
+                || lower.contains("self-pay") || lower.contains("payment");
     }
 
     @Override
@@ -78,6 +81,7 @@ public class InsuranceValidatorAgent implements WorkerAgent {
                     .jsonMode();
 
             GlmClient.GlmResponse response = glmClient.chat(request);
+            @SuppressWarnings("unchecked")
             Map<String, Object> verificationData = mapper.readValue(response.getContent(), Map.class);
 
             currentStep.setOutput(verificationData);
